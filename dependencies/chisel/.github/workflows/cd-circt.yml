@@ -1,0 +1,25 @@
+name: 'CD (firtool)'
+
+on:
+  workflow_dispatch:
+  # Run every 15 minutes.
+  schedule:
+    - cron: '*/15 * * * *'
+
+jobs:
+  cd-circt:
+    name: 'Check Version, Create PR'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 'circt/update-circt'
+        uses: circt/update-circt@eacb8963f4f0872649ef5bb3245894929ddebe58 # v1.1.1
+        with:
+          user: chiselbot
+          email: chiselbot@users.noreply.github.com
+          pr-labels: |
+            Dependency Update
+          pr-reviewers: |
+            seldridge
+            jackkoenig
+          should-create-pr: '.github/scripts/check-maven-for-llvm-firtool-version.sh'
+          github-token: ${{ secrets.CHISEL_BOT_TOKEN }}

@@ -1,0 +1,58 @@
+package build.plugin
+
+import mill._
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+import mill.api.Cross
+
+import build._
+
+object `package` extends Module {
+  // https://github.com/com-lihaoyi/mill/issues/3693
+  object cross extends Cross[Plugin](v.pluginScalaCrossVersions)
+
+  def publishableVersions = Task {
+    v.pluginScalaCrossVersions.filter(!v.isScala3(_))
+  }
+}
+
+trait Plugin extends CrossSbtModule with ScalafmtModule with ChiselPublishModule {
+  override def artifactName = "chisel-plugin"
+
+  def moduleDir = super.moduleDir / os.up
+
+  // The plugin is compiled for every minor Scala version
+  override def crossFullScalaVersion = true
+
+  // This is a bit of a hack, but for some reason, Scala compilation crashes with -release 8 for
+  // Scala 2.13.0-2.13.2. While -release 8 is what we want, -target:jvm-1.8 at least ensures the
+  // bytecode is Java 8 compatible, and then the higher Scala versions compiled with -release 8 will
+  // enforce the other guarantees of -release 8 (that we don't accidentally use Java APIs introduced
+  // in newer JDKs).
+  def releaseArg(scalaVersion: String): Seq[String] = {
+    val badSet = Set("2.13.0", "2.13.1", "2.13.2")
+    if (badSet.contains(scalaVersion)) Seq("-target:jvm-1.8")
+    else Seq("-release", "8")
+  }
+
+  // Does not use common options because -Wconf wasn't supported in early 2.13, nor was "-release:"
+  override def scalacOptions = super.scalacOptions() ++ releaseArg(crossScalaVersion)
+
+  def scalaLibraryMvn = v.scalaLibrary(crossScalaVersion)
+  def scalaReflectMvn = v.scalaReflect(crossScalaVersion)
+  def scala2CompilerMvn: Dep = v.scala2Compiler(crossScalaVersion)
+  def scala3CompilerMvn: Dep = v.scala3Compiler(crossScalaVersion)
+
+  def mvnDeps = Task {
+    if (!v.isScala3(crossScalaVersion)) {
+      super.mvnDeps() ++ Seq(scalaLibraryMvn, scalaReflectMvn, scala2CompilerMvn)
+    } else {
+      super.mvnDeps() ++ Seq(scala3CompilerMvn)
+    }
+  }
+
+  override def resources = Task.Sources {
+    if (v.isScala3(crossScalaVersion)) moduleDir / "src" / "main" / "resources-3"
+    else moduleDir / "src" / "main" / "resources-2"
+  }
+}

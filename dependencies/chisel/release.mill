@@ -1,0 +1,185 @@
+package build
+
+import mill._
+import mill.api.{BuildCtx, Result}
+import mill.javalib.SonatypeCentralPublishModule
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+import mill.scalalib.publish._
+import mill.util.Jvm.createJar
+import com.github.lolgab.mill.mima._
+
+//import de.tobiasroeser.mill.vcs.version.VcsVersion
+
+import build._
+
+/** Adds basic publishing information--useful for local publishing */
+trait ChiselPublishModule extends SonatypeCentralPublishModule {
+  // Publish information
+  def pomSettings = PomSettings(
+    description = artifactName(),
+    organization = "org.chipsalliance",
+    url = "https://www.chisel-lang.org",
+    licenses = Seq(License.`Apache-2.0`),
+    versionControl = VersionControl.github("chipsalliance", "chisel"),
+    developers = Seq(
+      Developer("jackkoenig", "Jack Koenig", "https://github.com/jackkoenig"),
+      Developer("azidar", "Adam Izraelevitz", "https://github.com/azidar"),
+      Developer("seldridge", "Schuyler Eldridge", "https://github.com/seldridge")
+    )
+  )
+
+  override def publishVersion = v.version()
+}
+
+/** Aggregate project for publishing Chisel as a single artifact
+  */
+trait Unipublish extends ScalaModule with ChiselPublishModule with Mima {
+
+  def scalaVersion = v.defaultScalaVersion
+
+  /** Is this a SNAPSHOT release?  */
+  def isSnapshot = Task { publishVersion().endsWith("-SNAPSHOT") }
+
+  // This is published as chisel
+  override def artifactName = "chisel"
+
+  override def mimaPreviousVersions = Task.Input {
+    os.read.lines(BuildCtx.workspaceRoot / "etc" / "previous-versions.txt")
+  }
+
+  override def mimaBinaryIssueFilters = super.mimaBinaryIssueFilters() ++ Seq(
+    // chisel3.internal.firrtl.ir is package private
+    ProblemFilter.exclude[DirectMissingMethodProblem]("chisel3.internal.firrtl.ir*"),
+    ProblemFilter.exclude[IncompatibleResultTypeProblem]("chisel3.internal.firrtl.ir*"),
+    ProblemFilter.exclude[MissingTypesProblem]("chisel3.internal.firrtl.ir*"),
+    ProblemFilter.exclude[MissingClassProblem]("chisel3.internal.firrtl.ir*"),
+    // This was package private and is fine to break.
+    ProblemFilter.exclude[MissingClassProblem]("chisel3.util.BlackBoxHelpers*"),
+    // firrtl is deprecated and is fine to break.
+    ProblemFilter.exclude[DirectMissingMethodProblem]("firrtl.ir*"),
+    ProblemFilter.exclude[IncompatibleResultTypeProblem]("firrtl.ir*"),
+    ProblemFilter.exclude[MissingTypesProblem]("firrtl.ir*"),
+    ProblemFilter.exclude[MissingClassProblem]("firrtl.ir*"),
+    // chisel3.UnitTests.Config should never have been public and was unused in public APIs
+    ProblemFilter.exclude[DirectMissingMethodProblem]("chisel3.UnitTests#Config*"),
+    ProblemFilter.exclude[IncompatibleResultTypeProblem]("chisel3.UnitTests#Config*"),
+    ProblemFilter.exclude[MissingTypesProblem]("chisel3.UnitTests$Config*")
+  )
+
+  /** Publish both this project and the plugin (for the default Scala version) */
+  override def publishLocal(
+    localMvnRepo: String = null,
+    sources:      Boolean = true,
+    doc:          Boolean = true,
+    transitive:   Boolean = false
+  ) = Task.Command {
+    // TODO consider making this parallel and publishing all cross-versions for plugin
+    plugin.cross(v.defaultScalaVersion).publishLocal(localMvnRepo, sources, doc, transitive)()
+    super.publishLocal(localMvnRepo, sources, doc, transitive)()
+  }
+
+  // Explicitly not using moduleDeps because that influences so many things
+  def components = Seq(firrtl.cross, svsim.cross, macros.cross, core.cross, chisel).map(_(v.defaultCrossVersion))
+
+  /** Aggregated mvn deps to include as dependencies in POM */
+  def mvnDeps = Task { Task.traverse(components)(_.mvnDeps)().flatten }
+
+  /** Aggregated compile (Maven provided scope) dependencies to be included in POM */
+  def compileMvnDeps = Task { Task.traverse(components)(_.compileMvnDeps)().flatten }
+
+  /** Aggregated local classpath to include in jar */
+  override def localClasspath = Task { Task.traverse(components)(_.localClasspath)().flatten }
+
+  /** Aggreagted sources from all component modules */
+  def aggregatedSources = Task { Task.traverse(components)(_.allSources)().flatten }
+
+  /** Aggreagted resources from all component modules */
+  def aggregatedResources = Task { Task.traverse(components)(_.resources)().flatten }
+
+  /** Aggreagted compile resources from all component modules */
+  def aggregatedCompileResources = Task { Task.traverse(components)(_.compileResources)().flatten }
+
+  /** Aggregated sourceJar from all component modules
+    */
+  override def sourceJar: T[PathRef] = Task {
+    // This is based on the implementation of sourceJar in PublishModule, may need to be kept in sync.
+    val allDirs = aggregatedSources() ++ aggregatedResources() ++ aggregatedCompileResources()
+    val jar = createJar(Task.dest / "out.jar", allDirs.map(_.path).filter(os.exists), manifest())
+    Result.Success(PathRef(jar))
+  }
+
+  // Needed for ScalaDoc
+  override def scalacOptions = v.scala2CommonOptions(Nil)
+
+  def scalaDocRootDoc = Task.Source { BuildCtx.workspaceRoot / "root-doc.txt" }
+
+  def unidocOptions = Task {
+    scalacOptions() ++ Seq[String](
+      "-classpath",
+      unidocCompileClasspath().map(_.path).mkString(sys.props("path.separator")),
+      "-diagrams",
+      "-groups",
+      "-skip-packages",
+      "chisel3.internal",
+      "-diagrams-max-classes",
+      "25",
+      "-doc-version",
+      publishVersion(),
+      "-doc-title",
+      "chisel",
+      "-doc-root-content",
+      scalaDocRootDoc().path.toString,
+      "-sourcepath",
+      BuildCtx.workspaceRoot.toString,
+      "-doc-source-url",
+      unidocSourceUrl(),
+      "-language:implicitConversions",
+      "-implicits"
+    )
+  }
+
+  // Built-in UnidocModule is insufficient so we need to implement it ourselves
+  // We could factor this out into a utility
+  def unidocSourceUrl: T[String] = Task {
+    val base = "https://github.com/chipsalliance/chisel/tree"
+    val branch = if (publishVersion().endsWith("-SNAPSHOT")) "main" else s"v${publishVersion()}"
+    s"$base/$branch/€{FILE_PATH_EXT}#L€{FILE_LINE}"
+  }
+
+  def unidocVersion: T[Option[String]] = None
+
+  def unidocCompileClasspath = Task {
+    Seq(compile().classes) ++ Task.traverse(components)(_.compileClasspath)().flatten
+  }
+
+  def unidocSourceFiles = Task {
+    allSourceFiles() ++ Task.traverse(components)(_.allSourceFiles)().flatten
+  }
+
+  // Based on UnidocModule and docJar in Mill, may need to be kept in sync.
+  override def docJar = Task {
+    Task.log.info(s"Building unidoc for ${unidocSourceFiles().length} files")
+
+    val javadocDir = Task.dest / "javadoc"
+    os.makeDir(javadocDir)
+
+    val fullOptions = unidocOptions() ++
+      Seq("-d", javadocDir.toString) ++
+      unidocSourceFiles().map(_.path.toString)
+
+    jvmWorker()
+      .worker()
+      .docJar(
+        scalaVersion(),
+        scalaOrganization(),
+        scalaDocClasspath(),
+        scalacPluginClasspath(),
+        None,
+        fullOptions
+      ) match {
+      case true  => Result.Success(PathRef(createJar(Task.dest / "out.jar", Seq(javadocDir))))
+      case false => Result.Failure("docJar generation failed")
+    }
+  }
+}

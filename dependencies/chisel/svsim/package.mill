@@ -1,0 +1,48 @@
+package build.svsim
+
+import mill._
+import mill.api.{BuildCtx, Cross}
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+
+import build._
+
+object `package` extends Module {
+  // https://github.com/com-lihaoyi/mill/issues/3693
+  object cross extends Cross[Svsim](v.scalaCrossVersions)
+}
+
+trait Svsim extends ChiselCrossModule with HasCommonOptions with ScalafmtModule {
+
+  def moduleDir = super.moduleDir / os.up
+
+  override def scalacOptions = Task {
+    super.scalacOptions() ++
+      Option.when(!v.isScala3(crossScalaVersion))(
+        "-Xsource-features:case-apply-copy-access"
+      )
+  }
+
+  object test extends SbtTests with TestModule.ScalaTest with ScalafmtModule {
+    def mvnDeps = Seq(v.scalatest, v.scalacheck)
+  }
+
+  def clangFormatConfig = Task.Source {
+    BuildCtx.workspaceRoot / "svsim" / ".clang-format"
+  }
+
+  def cppSources = Task.Sources {
+    BuildCtx.workspaceRoot / "svsim" / "src" / "main" / "resources" / "simulation-driver.cpp"
+  }
+
+  def clangformat(args: String*) = Task.Command {
+    os.proc(
+      "clang-format",
+      "-i",
+      "--verbose",
+      s"--style=file:${clangFormatConfig().path}",
+      cppSources()
+    ).call(cwd = Task.dest)
+  }
+
+}

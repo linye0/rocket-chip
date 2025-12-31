@@ -1,0 +1,59 @@
+name: Build and Test Chisel Scala-CLI Example
+
+on:
+  workflow_call:
+    inputs:
+      circt:
+        description: 'The version of CIRCT to use'
+        type: string
+
+jobs:
+  build_example:
+    name: Build and Test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        # Need to fetch full history for deriving version
+        with:
+          fetch-depth: 0
+      - name: Install CIRCT
+        id: install-circt
+        if: ${{ inputs.circt }}
+        uses: circt/install-circt@3f8dda6e1c1965537b5801a43c81c287bac4eae4 # v1.1.1
+        with:
+          version: ${{ inputs.circt }}
+          github-token: ${{ github.token }}
+      # TODO have install-circt do this
+      - name: Set CHISEL_FIRTOOL_PATH
+        if: steps.install-circt.outcome == 'success'
+        run: |
+          dir=$(dirname $(which firtool))
+          echo "CHISEL_FIRTOOL_PATH=$dir" >> "$GITHUB_ENV"
+      - name: Cache Scala-CLI
+        uses: coursier/cache-action@bebeeb0e6f48ebad66d3783946588ecf43114433 # v7.0.0
+      - name: Setup Scala-CLI
+        uses: VirtusLab/scala-cli-setup@77834b5926f3eb70869d8009530c65585f7a039b # v1.9.1
+        with:
+          jvm: adoptium:17
+      - name: Generate Chisel Scala CLI Example
+        shell: bash
+        run: |
+          # Determine the version and insert it into the example
+          VERSION=$(./mill show unipublish.publishVersion | tr -d \")
+          .github/scripts/generate-scala-cli-example.sh $VERSION > chisel-example.scala
+      # Need to publishLocal to test the example
+      - name: Publish Local
+        shell: bash
+        run: |
+          ./mill -i unipublish.publishLocal
+      - name: Test Scala CLI Example
+        shell: bash
+        run: scala-cli chisel-example.scala
+      - name: Upload Example
+        uses: actions/upload-artifact@v5
+        with:
+          name: chisel-example.scala
+          path: chisel-example.scala
+          retention-days: 7

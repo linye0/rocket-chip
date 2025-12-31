@@ -1,0 +1,118 @@
+name: Continuous Integration
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches-ignore:
+      - ci/ci-circt-nightly
+  push:
+    tags:
+      - '*'
+    branches:
+      - main
+      - '*.x'
+
+jobs:
+  ci:
+    name: ci
+    strategy:
+      matrix:
+        system: ["ubuntu-24.04"]
+        jvm: [21]
+        scala: ["2.13"]
+        espresso: ["2.4"]
+        slang: ["7.0"]
+    uses: ./.github/workflows/test.yml
+    with:
+      system: ${{ matrix.system }}
+      jvm: ${{ matrix.jvm }}
+      scala: ${{ matrix.scala }}
+      espresso: ${{ matrix.espresso }}
+      slang: ${{ matrix.slang }}
+
+  # Sentinel job to simplify how we specify which checks need to pass in branch
+  # protection and in Mergify. This job checks that all matrix jobs were
+  # successful.
+  check-tests:
+    name: "check tests"
+    needs: ci
+    runs-on: ubuntu-24.04
+    outputs:
+      success: ${{ steps.setoutput.outputs.success }}
+    steps:
+      - id: setoutput
+        run: echo "success=true" >> $GITHUB_OUTPUT
+
+  # Related to check-tests above, this job _always_ runs (even if tests fail
+  # and thus check-steps is skipped). This two sentinel job approach avoids an
+  # issue where failing tests causes a single sentinel job to be skipped which
+  # counts as passing for purposes of branch protection.
+  #
+  # See: https://brunoscheufler.com/blog/2022-04-09-the-required-github-status-check-that-wasnt
+  all_tests_passed:
+    name: "all tests passed"
+    runs-on: ubuntu-24.04
+    if: always() # Always run so that we never skip this check
+    needs: check-tests
+      # Pass only if check-tests set its output value
+    steps:
+      - run: |
+          PASSED=${{ needs.check-tests.outputs.success }}
+          if [[ $PASSED == "true" ]]; then
+            echo "### All tests passed! :rocket:" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            echo "### One or more tests FAILED! :bangbang:" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  # mill ci release publishes all cross versions so this job needs to be
+  # separate from a Scala versions build matrix to avoid duplicate publishing
+  publish:
+    needs: [all_tests_passed]
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Cache Scala
+        uses: coursier/cache-action@bebeeb0e6f48ebad66d3783946588ecf43114433 # v7.0.0
+      - name: Setup Scala
+        uses: VirtusLab/scala-cli-setup@77834b5926f3eb70869d8009530c65585f7a039b # v1.9.1
+        with:
+          jvm: temurin:11
+      - name: Publish
+        run: .github/scripts/publish.sh
+        env:
+          MILL_PGP_PASSPHRASE: ${{ secrets.PGP_PASSPHRASE }}
+          MILL_PGP_SECRET_BASE64: ${{ secrets.PGP_SECRET }}
+          MILL_SONATYPE_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MILL_SONATYPE_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+      - run: |
+          VERSION=$(./mill show unipublish.publishVersion | tr -d \")
+          echo "Published version: $VERSION" >> $GITHUB_STEP_SUMMARY
+
+
+  deploy_website:
+    name: Deploy Website
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    needs: [all_tests_passed]
+    # Only Deploy website on pushes to main, may change to a stable branch
+    if: (github.event_name == 'push') && (github.ref_name == 'main')
+    steps:
+      - name: Download built website
+        uses: actions/download-artifact@v6
+        with:
+          name: website
+      - name: Untar built website
+        run: tar zxf website.tar.gz
+      - name: Deploy Website to GitHub Pages (From Main Branch)
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: website/build

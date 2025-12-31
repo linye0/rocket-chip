@@ -1,0 +1,330 @@
+//| mill-version: 1.0.6-jvm
+//| mvnDeps:
+//| - com.lihaoyi::mill-contrib-jmh:$MILL_VERSION
+//| - com.47deg::github4s:0.33.3
+//| - com.lumidion::sonatype-central-client-requests:0.6.0
+//| - com.github.lolgab::mill-mima::0.2.0
+
+package build
+
+import mill._
+import mill.api.{BuildCtx, Result}
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+
+object v extends Module {
+
+  // Add support for later Scala 2.13 by bumping this.
+  val scala213MinorVersion: Int = 18
+
+  // Bump Scala 3 version by bumping this.
+  val scala3MinorVersion: String = "3.4"
+
+  val javaVersion = {
+    val rawVersion = sys.props("java.specification.version")
+    // Older versions of Java started with 1., e.g. 1.8 == 8
+    rawVersion.stripPrefix("1.").toInt
+  }
+
+  val circtJson = BuildCtx.watchValue(
+    os.read(BuildCtx.workspaceRoot / "etc" / "circt.json")
+  )
+
+  val firtoolVersion = {
+    val j = _root_.upickle.default.read[Map[String, String]](circtJson)
+    j("version").stripPrefix("firtool-")
+  }
+  // Java 21+ requires Scala 2.13.11+.
+  // Only publish plugin for 2.13.11+ when using Java > 11, but still
+  // publish all versions when Java version <= 11.
+  val pluginScalaCrossVersions = {
+    val java21Min213 = 11
+    val minVersion = if (javaVersion > 11) java21Min213 else 0
+    val versions = minVersion to scala213MinorVersion
+    val versionSeq = versions.map(v => s"2.13.$v").toSeq
+    versionSeq :+ scalaCrossToVersion("3")
+  }
+
+  val scalaCrossVersions = Seq("2.13", "3")
+
+  def scalaCrossToVersion(major: String): String = major match {
+    case "2.13" => s"2.13.$scala213MinorVersion"
+    case "3"    => s"3.$scala3MinorVersion"
+  }
+
+  def scalaVersionToCross(version: String): String =
+    if (version.startsWith("2.13")) "2.13"
+    else if (version.startsWith("3.")) "3"
+    else throw new Exception(s"Unsupported version $version")
+
+  def isScala3(ver: String): Boolean = ver.startsWith("3")
+
+  def buildUnits(): Seq[ScalaModule] = {
+    scalaCrossVersions.flatMap { ver =>
+      Seq(
+        chisel(ver),
+        stdlib.cross(ver),
+        chisel(ver).test,
+        firrtl.cross(ver).test,
+        svsim.cross(ver).test,
+        unipublish
+      )
+    } ++ scalaCrossVersions.filterNot(isScala3(_)).flatMap { ver2 =>
+      Seq(
+        `integration-tests`.cross(ver2).test,
+        lit.utility.cross(ver2)
+      )
+    }
+  }
+
+  def defaultCrossVersion = scalaCrossVersions.head
+
+  def defaultScalaVersion = scalaCrossToVersion(defaultCrossVersion)
+
+  val jmhVersion = "1.37"
+  val osLib = mvn"com.lihaoyi::os-lib:0.10.7" // 0.11 requires Java 11
+  val upickle = mvn"com.lihaoyi::upickle:3.3.1" // upickle 4.0 requires Scala 3.4 (we target Scala 3.3 LTS)
+  val firtoolResolver = mvn"org.chipsalliance::firtool-resolver:2.0.1"
+  val scalatest = mvn"org.scalatest::scalatest:3.2.19"
+  val scalacheck = mvn"org.scalatestplus::scalacheck-1-18:3.2.19.0"
+  val json4s = mvn"io.github.json4s::json4s-native:4.1.0"
+  val dataclass = mvn"io.github.alexarchambault::data-class:0.2.7"
+  val commonText = mvn"org.apache.commons:commons-text:1.15.0"
+  val scopt = mvn"com.github.scopt::scopt:4.1.0"
+  val mdoc = mvn"org.scalameta::mdoc:2.8.2"
+
+  def scalaReflect(scalaVersion:   String) = mvn"org.scala-lang:scala-reflect:$scalaVersion"
+  def scala2Compiler(scalaVersion: String) = mvn"org.scala-lang:scala-compiler:$scalaVersion"
+  def scala3Compiler(scalaVersion: String) = mvn"org.scala-lang::scala3-compiler:$scalaVersion"
+  def scalaLibrary(scalaVersion:   String) = mvn"org.scala-lang:scala-library:$scalaVersion"
+
+  def circt(version: String, os: String, platform: String) =
+    s"https://github.com/llvm/circt/releases/download/firtool-${version}/circt-full-shared-${os}-${platform}.tar.gz"
+
+  val scala2WarnConf = Seq(
+    "msg=APIs in chisel3.internal:s",
+    "msg=All APIs in package firrtl:s",
+    "msg=migration to the MLIR:s",
+    "msg=method hasDefiniteSize in trait IterableOnceOps is deprecated:s", // replacement `knownSize` is not in 2.12
+    "msg=object JavaConverters in package collection is deprecated:s",
+    "msg=undefined in comment for method cf in class PrintableHelper:s",
+    // This is deprecated for external users but not internal use
+    "cat=deprecation&origin=firrtl\\.options\\.internal\\.WriteableCircuitAnnotation:s",
+    "cat=deprecation&origin=chisel3\\.util\\.experimental\\.BoringUtils.*:s",
+    "cat=deprecation&origin=chisel3\\.experimental\\.IntrinsicModule:s",
+    "cat=deprecation&origin=chisel3\\.ltl.*:s",
+    "cat=deprecation&origin=chisel3\\.InstanceId:s",
+    // Deprecated for external users, will eventually be removed.
+    "cat=deprecation&msg=Looking up Modules is deprecated:s",
+    // Only for testing of deprecated APIs
+    "cat=deprecation&msg=Use of @instantiable on user-defined types is deprecated:s",
+    // FirtoolResolver uses package shading which causes issues with metadata for inlining.
+    // We don't want to inline from it anyway so just suppress the warning.
+    "msg=reading InlineInfoAttribute from firtoolresolver:s",
+    // Scala 2.13.17 adds warning for inferred structural types but this is not
+    // a problem because in Scala 3 we use Selectable.
+    "msg=will no longer have a structural type:s"
+  )
+
+  // ScalacOptions
+  def scala2CommonOptions(extraWarnConf: Seq[String]) = Seq(
+    "-deprecation",
+    "-feature",
+    "-unchecked",
+    "-Werror",
+    "-Ymacro-annotations",
+    "-release:8",
+    "-explaintypes",
+    "-Xcheckinit",
+    "-Xlint:infer-any",
+    "-Xlint:missing-interpolator",
+    "-language:reflectiveCalls",
+    // It is crucial to only ever inline from within the same artifact.
+    // Despite having several comilation units, we publish them together as a
+    // single artifact so it is safe to inline anything in the chisel3 package.
+    // See documentation: https://docs.scala-lang.org/overviews/compiler-options/optimizer.html
+    "-opt:l:inline",
+    "-opt-inline-from:chisel3.**",
+    s"-Wconf:${(scala2WarnConf ++ extraWarnConf).mkString(",")}"
+  )
+
+  def rootDir = BuildCtx.workspaceRoot
+
+  /** The Chisel version, used by publishVersion and BuildInfo */
+  def version = Task.Input {
+    val previousTagOpt = {
+      val proc = os.call(("git", "describe", "--tags", "--abbrev=0"), cwd = rootDir, stderr = os.Pipe, check = false)
+      // non-zero exit means not a git repo, e.g. CI
+      Option.when(proc.exitCode == 0) {
+        proc.out.trim()
+      }
+    }
+    previousTagOpt match {
+      case None => "unknown"
+      case Some(previousTag) =>
+        val previousTagNoV = previousTag.stripPrefix("v")
+        val commitsSincePreviousTag = {
+          val proc =
+            os.call(("git", "rev-list", "--count", "HEAD", "--not", previousTag), cwd = rootDir, stderr = os.Pipe)
+          proc.out.trim().toInt
+        }
+        if (commitsSincePreviousTag == 0) {
+          previousTagNoV // really the current tag
+        } else {
+          val currentCommit = {
+            val proc = os.call(("git", "rev-parse", "HEAD"), cwd = rootDir, stderr = os.Pipe)
+            proc.out.trim().take(8) // include first 8 characters of commit hash
+          }
+          s"$previousTagNoV+$commitsSincePreviousTag-$currentCommit-SNAPSHOT"
+        }
+    }
+  }
+}
+
+/** Alias for compiling everything */
+def compileAll() = Task.Command {
+  Task.traverse(v.buildUnits())(_.compile)()
+}
+
+/** Alias command for running mdoc */
+def mdoc() = Task.Command {
+  docs.mdoc()
+}
+
+/** The latest stable version */
+def latestStableVersion() = Task.Command {
+  docs.latestStableVersion()
+}
+
+/** Our base trait that helps with our simplified cross versioning (2.13 instead of 2.13.18)
+  *
+  * Keep this lean, it's mixed in to firrtl and svsim as well.
+  */
+trait ChiselCrossModule extends CrossSbtModule {
+  protected def _scalaVersion = v.scalaCrossToVersion(crossScalaVersion)
+  def scalaVersion = _scalaVersion
+}
+
+trait HasScala2MacroAnno extends CrossModuleBase {
+  override def scalacOptions = Task {
+    if (!v.isScala3(crossScalaVersion)) {
+      super.scalacOptions() ++ Seq("-Ymacro-annotations")
+    } else super.scalacOptions()
+  }
+}
+
+trait HasScalaPlugin extends ChiselCrossModule {
+  import build_.plugin.Plugin
+
+  def pluginModule: Plugin = plugin.cross(_scalaVersion)
+
+  override def scalacOptions = Task {
+    super.scalacOptions() ++ Seq(s"-Xplugin:${pluginModule.jar().path}")
+  }
+
+  override def scalacPluginClasspath = Task {
+    super.scalacPluginClasspath() ++ Seq(pluginModule.jar())
+  }
+}
+
+trait HasCommonOptions extends CrossModuleBase {
+  def xsource3: Boolean = true
+
+  /** Extra warning configuration to include in scalacOptions */
+  def extraWarnConf: Seq[String] = Nil
+  override def scalacOptions = Task {
+    if (!v.isScala3(crossScalaVersion)) {
+      super.scalacOptions() ++ v.scala2CommonOptions(extraWarnConf) ++ Option.when(xsource3)("-Xsource:3")
+    } else super.scalacOptions()
+  }
+}
+
+// Build rules for managing circt artifacts
+object circt extends Module {
+  val architecture = System.getProperty("os.arch")
+  val operationSystem = System.getProperty("os.name")
+
+  val mac = operationSystem.toLowerCase.startsWith("mac")
+  val linux = operationSystem.toLowerCase.startsWith("linux")
+  val windows = operationSystem.toLowerCase.startsWith("win")
+  val amd64 = architecture.matches("^(x8664|amd64|ia32e|em64t|x64|x86_64)$")
+  val aarch64 = architecture.equals("aarch64") | architecture.startsWith("armv8")
+
+  def circt(version: String, os: String, platform: String) =
+    s"https://github.com/llvm/circt/releases/download/firtool-${version}/circt-full-shared-${os}-${platform}.tar.gz"
+
+  // Copy-pasted from Mill 0.12.14 and updated to Mill 1.0.0 (MIT License)
+  def download(url: String, dest: os.RelPath)(implicit ctx: mill.api.TaskCtx.Dest): PathRef = {
+    val out = ctx.dest / dest
+    val website = new java.net.URI(url).toURL
+    val websiteInputStream = website.openStream
+    try {
+      java.nio.file.Files.copy(websiteInputStream, out.toNIO)
+      PathRef(out)
+    } finally {
+      websiteInputStream.close()
+    }
+  }
+
+  // use Task(persistent = true) to avoid download repeatedly
+  def installDir: T[os.Path] = Task(persistent = true) {
+    Task.ctx().env.get("CIRCT_INSTALL_PATH") match {
+      case Some(dir) => os.Path(dir)
+      case None =>
+        Task.ctx().log.info("Use CIRCT_INSTALL_PATH to vendor circt")
+        val tarPath = Task.dest / "circt.tar.gz"
+        if (!os.exists(tarPath)) {
+          val url = circt(
+            v.firtoolVersion,
+            if (linux) "linux" else if (mac) "macos" else throw new Exception("unsupported os"),
+            // circt does not yet publish for macos-aarch64, use x64 for now
+            if (amd64 || mac) "x64" else throw new Exception("unsupported arch")
+          )
+          Task.ctx().log.info(s"Downloading circt from ${url}")
+          download(url, os.rel / "circt.tar.gz")
+          Task.ctx().log.info(s"Download Successfully")
+        }
+        os.proc("tar", "xvf", tarPath, "--strip-components=1").call(Task.dest)
+        Task.dest
+    }
+  }
+
+  def binDir = Task(installDir() / "bin")
+}
+
+// TODO: move chisel src to subfolder once we have dropped sbt flow
+object chisel extends Cross[Chisel](v.scalaCrossVersions)
+
+trait Chisel extends CrossSbtModule with HasScala2MacroAnno with HasScalaPlugin with ScalafmtModule {
+
+  override def moduleDir = super.moduleDir / os.up
+  def svsimModule = svsim.cross(crossScalaVersion)
+  def coreModule = core.cross(crossScalaVersion)
+
+  override def scalacOptions = Task {
+    if (v.isScala3(crossScalaVersion)) {
+      super.scalacOptions()
+    } else {
+      super.scalacOptions() ++ v.scala2CommonOptions(Nil)
+    }
+  }
+
+  override def moduleDeps = super.moduleDeps ++ Seq(coreModule, svsimModule)
+
+  def compileMvnDeps = Seq(v.scalatest)
+
+  object test extends CrossSbtTests with TestModule.ScalaTest with ScalafmtModule {
+    def mvnDeps = Seq(v.scalatest, v.scalacheck)
+
+    // TODO: enable sandbox and run tests in parallel
+    override def testSandboxWorkingDir = false
+
+    // Suppress Scala 3 behavior requiring explicit types on implicit definitions
+    // Note this must come before the -Wconf is warningSuppression
+    override def scalacOptions = Task { super.scalacOptions() :+ "-Wconf:cat=other-implicit-type:s" }
+
+    override def testForkGrouping = discoveredTestClasses().grouped(8).toSeq
+  }
+}
+
+object unipublish extends Unipublish

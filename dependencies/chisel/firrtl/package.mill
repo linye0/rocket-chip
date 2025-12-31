@@ -1,0 +1,49 @@
+package build.firrtl
+
+import mill._
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+import mill.api.Cross
+
+import build._
+
+object `package` extends Module {
+  // https://github.com/com-lihaoyi/mill/issues/3693
+  object cross extends Cross[Firrtl](v.scalaCrossVersions)
+}
+
+trait Firrtl extends ChiselCrossModule with HasScala2MacroAnno with HasCommonOptions with ScalafmtModule {
+
+  def moduleDir = super.moduleDir / os.up
+
+  override def scalacOptions = Task {
+    super.scalacOptions() ++ {
+      if (v.isScala3(crossScalaVersion)) Seq.empty[String]
+      else
+        Seq(
+          "-language:reflectiveCalls",
+          "-language:existentials",
+          "-language:implicitConversions",
+          "-Yrangepos", // required by SemanticDB compiler plugin
+          "-Xsource-features:infer-override"
+        )
+    }
+  }
+
+  val commonDeps = Seq(
+    v.scopt,
+    v.commonText,
+    v.osLib,
+    v.json4s
+  )
+
+  def mvnDeps = if (v.isScala3(crossScalaVersion)) {
+    commonDeps
+  } else {
+    commonDeps ++ Seq(v.dataclass)
+  }
+
+  object test extends SbtTests with TestModule.ScalaTest with ScalafmtModule {
+    def mvnDeps = Seq(v.scalatest, v.scalacheck)
+  }
+}

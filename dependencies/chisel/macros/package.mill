@@ -1,0 +1,25 @@
+package build.macros
+
+import mill._
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+import mill.api.Cross
+
+import build._
+
+object `package` extends Module {
+  // https://github.com/com-lihaoyi/mill/issues/3693
+  object cross extends Cross[Macros](v.scalaCrossVersions)
+}
+
+trait Macros extends ChiselCrossModule with HasScala2MacroAnno with HasCommonOptions with ScalafmtModule {
+
+  def moduleDir = super.moduleDir / os.up
+
+  override def mvnDeps =
+    if (!v.isScala3(crossScalaVersion)) {
+      super.mvnDeps() ++ Seq(v.scalaReflect(_scalaVersion))
+    } else {
+      super.mvnDeps()
+    }
+}

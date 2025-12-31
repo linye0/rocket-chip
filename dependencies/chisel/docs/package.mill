@@ -1,0 +1,168 @@
+// See LICENSE for license details.
+
+package build.docs
+
+import mill._
+import mill.api.{BuildCtx, Result}
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+import mill.util.Jvm
+
+import build._
+
+/** MDoc project */
+object `package` extends HasScalaPlugin with HasCommonOptions {
+
+  override def scalaVersion = v.defaultScalaVersion
+
+  // This not really a CrossModule but HasScala2Plugin and HasCommonOptions require it
+  override def crossValue = v.scalaCrossVersions.head
+
+  // Our scala sources to be used by mdoc live here
+  override def moduleDir = super.moduleDir / os.up / "docs-target"
+
+  override def mvnDeps = Task { Seq(v.mdoc, v.scalatest) }
+
+  override def moduleDeps = Seq(chisel(crossValue))
+
+  // Suppress missing interpolator warnings because mdoc appears to introduce them.
+  override def extraWarnConf = Seq("msg=possible missing interpolator:s")
+
+  override def scalacOptions = Task {
+    super.scalacOptions() ++ Seq(
+      // We do not want to force type annotations onto the
+      // demonstration user code, especially this comes up in setting the elements of a Record
+      "-Xsource-features:infer-override"
+    )
+  }
+
+  def websiteGenerated = Task {
+    BuildCtx.withFilesystemCheckerDisabled {
+      val dir = moduleDir / os.up / "website" / "src" / "pages" / "generated"
+      os.makeDir.all(dir)
+      PathRef(dir)
+    }
+  }
+
+  def mdocSourceDir = moduleDir / os.up / "docs" / "src"
+
+  def mdocOutDir = moduleDir / os.up / "docs" / "generated"
+
+  def mdocSources = Task.Sources { mdocSourceDir }
+
+  def mdocExtraArguments = Task {
+    // None of our links are hygienic because they're primarily used on the website with .html
+    Seq("--cwd", "docs", "--no-link-hygiene")
+  }
+
+  // All Chisel releases, queried from Maven Central
+  def allReleases = Task {
+    releases(Task.log)
+  }
+
+  // Mapping of Chisel version to associated firtool version
+  def chiselVersionFirtoolVersionMapping = Task {
+    // Minimum version to record in the table
+    // Earlier versions don't use firtool
+    // This needs to be a def to avoid null pointer exception
+    def min = SemanticVersion.parse("v3.6.0-RC1")
+    // Some versions predate the ability to generate this list:
+    val hasFirtool = allReleases().filter(_ >= min)
+    val needsVersionLookup = {
+      val isKnownVersion = knownVersions.map(_._1).toSet
+      hasFirtool.filterNot(isKnownVersion)
+    }
+    val lookedUpVersions = needsVersionLookup.map(v => v -> lookupFirtoolVersion(v, Task.log))
+    val allVersions = knownVersions ++ lookedUpVersions
+    allVersions.sortBy(_._1).reverse
+  }
+
+  def latestStableVersion = Task {
+    getLatest(allReleases().toList).serialize
+  }
+
+  def firtoolVersionsTable = Task {
+    BuildCtx.withFilesystemCheckerDisabled {
+      val outputFile = Task.dest / "FirtoolVersionsTable.scala"
+      val versionMapping = chiselVersionFirtoolVersionMapping()
+      val releaseTable = generateTable(versionMapping, true, Task.log).replaceAll("\n", "\\\\n")
+      val prereleaseTable = generateTable(versionMapping, false, Task.log).replaceAll("\n", "\\\\n")
+      val contents =
+        s"""|object FirtoolVersionsTable {
+            |  def releaseTable = "$releaseTable"
+            |  def prereleaseTable = "$prereleaseTable"
+            |}""".stripMargin
+      os.write(outputFile, contents, createFolders = true)
+      PathRef(Task.dest)
+    }
+  }
+
+  override def generatedSources = Task {
+    super.generatedSources() :+ firtoolVersionsTable()
+  }
+
+  def mdoc = Task {
+    BuildCtx.withFilesystemCheckerDisabled {
+      val classpath = runClasspath().map(_.path)
+      val outDir = mdocOutDir
+
+      val inOutArgs =
+        mdocSources().flatMap(inDir => Seq[String]("--in", inDir.path.toString, "--out", outDir.toString))
+      val mdocArgs =
+        Seq("--classpath", classpath.mkString(":")) ++
+          Seq("--scalac-options", scalacOptions().map("\"" + _ + "\"").mkString(" ")) ++
+          inOutArgs ++ mdocExtraArguments()
+
+      Task.log.debug("Running mdoc with args: " + mdocArgs.mkString(" "))
+
+      Jvm.callProcess(
+        mainClass = "mdoc.Main",
+        classPath = classpath,
+        mainArgs = mdocArgs
+      )
+
+      PathRef(outDir)
+    }
+  }
+
+  def contributors = Task {
+    // Even though we no longer host all these projects,
+    // we still honor their contributions
+    Seq(
+      GitHubRepository("chipsalliance", "chisel"),
+      GitHubRepository("chipsalliance", "chisel-template"),
+      GitHubRepository("chipsalliance", "firrtl"),
+      GitHubRepository("chipsalliance", "treadle"),
+      GitHubRepository("ucb-bar", "chiseltest"),
+      GitHubRepository("ucb-bar", "chisel2-deprecated"),
+      GitHubRepository("freechipsproject", "chisel-bootcamp"),
+      GitHubRepository("freechipsproject", "chisel-testers"),
+      GitHubRepository("freechipsproject", "diagrammer"),
+      GitHubRepository("freechipsproject", "firrtl-interpreter"),
+      GitHubRepository("freechipsproject", "www.chisel-lang.org")
+    )
+      .flatMap(Contributors.contributors)
+      .map(b => (b.login, b.html_url))
+      .distinct
+  }
+
+  def contributorsMarkdown = Task {
+    BuildCtx.withFilesystemCheckerDisabled {
+      val output = websiteGenerated().path / "contributors.md"
+      os.write.over(output, "<!-- Automatically generated by Mill 'docs.contributorsMarkdown' task -->\n")
+      os.write.append(output, Contributors.contributorsMarkdown(contributors()))
+      PathRef(output)
+    }
+  }
+
+  def scaladocLinks = Task {
+    BuildCtx.withFilesystemCheckerDisabled {
+      val output = websiteGenerated().path / "scaladoc_links.md"
+      val snapshot = unipublish.publishVersion()
+      val markdown = generateMarkdown(Task.log)(snapshot)
+      os.write.over(output, "<!-- Automatically generated by Mill 'docs.scaladocLinks' task -->\n")
+      os.write.append(output, markdown)
+      PathRef(output)
+    }
+  }
+}

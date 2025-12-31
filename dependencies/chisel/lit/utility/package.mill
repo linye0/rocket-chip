@@ -1,0 +1,22 @@
+package build.lit.utility
+
+import mill._
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+import mill.api.Cross
+
+import build._
+
+object `package` extends Module {
+  // https://github.com/com-lihaoyi/mill/issues/3693
+  object cross extends Cross[LitUtility](v.scalaCrossVersions)
+}
+
+trait LitUtility extends ScalaModule with CrossModuleBase with HasScalaPlugin with ScalafmtModule {
+  override def scalacOptions = Task { Seq("-Ymacro-annotations") }
+
+  def chiselModule = chisel(crossScalaVersion)
+  def moduleDir = super.moduleDir / os.up
+
+  override def moduleDeps = super.moduleDeps ++ Some(chiselModule)
+}
